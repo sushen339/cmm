@@ -800,11 +800,15 @@ void allocate_memory() {
     
     int new_blocks = needed_mem_mb / block_size_mb;
     if (new_blocks == 0 && needed_mem_mb > 0) new_blocks = 1;
-    
-    // 限制每次分配的最大块数，实现更平滑的分配
+      // 限制每次分配的最大块数，实现更平滑的分配
 #ifdef _WIN32
     // Windows系统上限制更严格
     const int max_blocks_per_cycle = 300;
+    
+    // 应用限制 - Windows版本
+    if (new_blocks > allocated_blocks + max_blocks_per_cycle) {
+        new_blocks = allocated_blocks + max_blocks_per_cycle;
+    }
 #else
     // Linux系统上的限制
     const int max_blocks_per_cycle = 500;
@@ -1557,13 +1561,12 @@ int main(int argc, char *argv[]) {
         if (!daemon_mode) {
             // 清屏以更新状态显示
             clear_screen();
-            
-            // 生成CPU和内存进度条
+              // 生成CPU和内存进度条
             char cpu_bar[128] = {0};
             char mem_bar[128] = {0};
             
             // 基本状态信息
-            printf("\n系统状态:\n");
+            printf("\n==================== 系统状态 ====================\n");
             
             // 显示当前时间
             time_t now = time(NULL);
@@ -1610,13 +1613,14 @@ int main(int argc, char *argv[]) {
                    mem_bar, target_mem_percent, system_mem, self_mem_percent);
             
             // 详细模式下显示更多信息
-            if (verbose_mode) {
-                printf("详细信息: CPU占用=%6.2f%%, 控制=%3d%%, 滤波值=%.1f%%, MEM占用=%.1f%%, 滤波值=%.1f%%\n",
+            if (verbose_mode) {                printf("详细信息: CPU占用=%6.2f%%, 控制=%3d%%, 滤波值=%.1f%%, MEM占用=%.1f%%, 滤波值=%.1f%%\n",
                        current_cpu_load, busy_percentage, filtered_cpu_usage, 
                        get_system_mem_usage(), filtered_mem_usage);
                 printf("控制参数: PID(%.2f, %.2f, %.2f), 滤波系数: %.2f, CPU核心: %d\n",
                        pid_kp, pid_ki, pid_kd, filter_alpha, num_cpu_cores);
             }
+            
+            printf("\n=====================================================\n");
         }
         
         // 使用配置的更新间隔
