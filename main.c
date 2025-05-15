@@ -1,6 +1,6 @@
 /*
  * CMM - CPU和内存模拟器
- * 版本: 1.0.1
+ * 版本: 1.1.1
  * 
  * 用于在系统上模拟特定的CPU和内存负载
  * 支持Windows和Linux平台
@@ -212,16 +212,81 @@ double get_system_mem_usage() {
     }
     return (double)memInfo.dwMemoryLoad;
 #else
-    struct sysinfo info;
-    if (sysinfo(&info) != 0) {
-        return 0.0;
+    // 使用/proc/meminfo读取，确保与free -m命令输出对齐
+    FILE* fp = fopen("/proc/meminfo", "r");
+    if (fp == NULL) {
+        // 如果无法打开/proc/meminfo，回退到sysinfo方法
+        struct sysinfo info;
+        if (sysinfo(&info) != 0) {
+            return 0.0;
+        }
+        
+        long long total_mem = info.totalram;
+        long long free_mem = info.freeram + info.bufferram + info.sharedram;
+        long long used_mem = total_mem - free_mem;
+        
+        return (double)used_mem * 100.0 / total_mem;
+    }    // 从/proc/meminfo读取
+    char buffer[256];
+    unsigned long long mem_total = 0;
+    unsigned long long mem_free = 0;
+    unsigned long long mem_available = 0; // 新的指标，更准确
+    unsigned long long buffers = 0;
+    unsigned long long cached = 0;
+    unsigned long long slab = 0;
+    
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        unsigned long long value;
+        
+        if (sscanf(buffer, "%*[^:]: %llu", &value) == 1) {
+            if (strncmp(buffer, "MemTotal:", 9) == 0) {
+                mem_total = value;
+            } else if (strncmp(buffer, "MemFree:", 8) == 0) {
+                mem_free = value;
+            } else if (strncmp(buffer, "MemAvailable:", 13) == 0) {
+                mem_available = value;
+            } else if (strncmp(buffer, "Buffers:", 8) == 0) {
+                buffers = value;
+            } else if (strncmp(buffer, "Cached:", 7) == 0) {
+                cached = value;
+            } else if (strncmp(buffer, "Slab:", 5) == 0) {
+                slab = value;
+            }
+        }
     }
     
-    long long total_mem = info.totalram;
-    long long free_mem = info.freeram + info.bufferram + info.sharedram;
-    long long used_mem = total_mem - free_mem;
+    fclose(fp);
     
-    return (double)used_mem * 100.0 / total_mem;
+    // 如果没有读到有效内存信息，回退到sysinfo方法
+    if (mem_total == 0) {
+        struct sysinfo info;
+        if (sysinfo(&info) != 0) {
+            return 0.0;
+        }
+        
+        long long total_mem = info.totalram;
+        long long free_mem = info.freeram + info.bufferram + info.sharedram;
+        long long used_mem = total_mem - free_mem;
+        
+        return (double)used_mem * 100.0 / total_mem;
+    }
+    
+    // 计算与free -m对齐的内存使用率
+    // 如果有MemAvailable，优先使用它(更精确，Linux 3.14+)
+    unsigned long long used_mem;
+    if (mem_available > 0) {
+        used_mem = mem_total - mem_available;
+    } else {
+        // 兼容老版本内核的计算方式
+        used_mem = mem_total - mem_free - buffers - cached - slab;
+    }
+    
+    // 确保不出现负值
+    if (used_mem > mem_total) {
+        used_mem = mem_total;
+    }
+    
+    return (double)used_mem * 100.0 / mem_total;
 #endif
 }
 
@@ -235,6 +300,28 @@ unsigned long long get_total_system_memory() {
     }
     return (unsigned long long)memInfo.ullTotalPhys / (1024 * 1024);
 #else
+    // 优先使用/proc/meminfo以确保与free -m一致
+    FILE* fp = fopen("/proc/meminfo", "r");
+    if (fp != NULL) {
+        char buffer[256];
+        unsigned long long mem_total = 0;
+        
+        while (fgets(buffer, sizeof(buffer), fp)) {
+            if (strncmp(buffer, "MemTotal:", 9) == 0) {
+                sscanf(buffer, "MemTotal: %llu", &mem_total);
+                break;
+            }
+        }
+        
+        fclose(fp);
+        
+        if (mem_total > 0) {
+            // MemTotal以KB为单位，转换为MB
+            return mem_total / 1024;
+        }
+    }
+    
+    // 如果/proc/meminfo方法失败，回退到sysinfo
     struct sysinfo info;
     if (sysinfo(&info) != 0) {
         return 0;
@@ -451,19 +538,44 @@ void allocate_memory() {
     static int target_not_reached_counter = 0;    // 目标未达到计数器
     static int block_size_mb = 1;                 // 内存块大小(MB)
     static int consecutive_failed_allocations = 0; // 连续分配失败计数
+    static int stabilization_counter = 0;         // 稳定计数器，用于平滑分配过程
+    static double last_mem_usage = 0.0;           // 上次的内存使用率
+    static double avg_memory_change_rate = 0.0;   // 平均内存变化率
     
     // 获取当前系统内存使用情况
     double current_mem_usage_percent = get_system_mem_usage();
     
-    // 应用低通滤波器平滑内存使用率，使用更快的响应系数
-    double mem_filter_alpha = filter_alpha * 1.5; // 更快的响应速度
-    if (mem_filter_alpha > 0.7) mem_filter_alpha = 0.7; // 但最大不超过0.7
+    // 计算内存使用率变化率
+    double mem_change_rate = 0.0;
+    if (last_mem_usage > 0.0) {
+        mem_change_rate = fabs(current_mem_usage_percent - last_mem_usage);
+        // 使用指数加权移动平均更新平均变化率
+        if (avg_memory_change_rate == 0.0) {
+            avg_memory_change_rate = mem_change_rate;
+        } else {
+            avg_memory_change_rate = 0.7 * avg_memory_change_rate + 0.3 * mem_change_rate;
+        }
+    }
+    last_mem_usage = current_mem_usage_percent;
     
+    // 根据内存变化率动态调整滤波系数
+    // 变化大时使用小滤波系数，变化小时使用大滤波系数
+    double adaptive_filter_alpha = filter_alpha;
+    if (avg_memory_change_rate > 2.0) {
+        // 变化大，减小滤波系数，更多依赖历史值以减缓波动
+        adaptive_filter_alpha = filter_alpha * 0.5;
+    } else if (avg_memory_change_rate < 0.5) {
+        // 变化小，增大滤波系数，更快响应新值
+        adaptive_filter_alpha = filter_alpha * 1.5;
+        if (adaptive_filter_alpha > 0.8) adaptive_filter_alpha = 0.8;
+    }
+    
+    // 应用自适应低通滤波器平滑内存使用率
     if (filtered_mem_usage == 0.0) {
         filtered_mem_usage = current_mem_usage_percent;
     } else {
-        filtered_mem_usage = mem_filter_alpha * current_mem_usage_percent + 
-                             (1 - mem_filter_alpha) * filtered_mem_usage;
+        filtered_mem_usage = adaptive_filter_alpha * current_mem_usage_percent + 
+                             (1 - adaptive_filter_alpha) * filtered_mem_usage;
     }
     
     unsigned long long total_system_memory_mb = get_total_system_memory();
@@ -471,56 +583,77 @@ void allocate_memory() {
     // 计算目标内存百分比
     double target_mem_percent = (double)target_mem_usage_mb * 100.0 / total_system_memory_mb;
     
-    // 计算内存差距，更关注当前实际值而非滤波值
+    // 计算内存差距，同时考虑当前实际值和滤波值
     double mem_gap = target_mem_percent - current_mem_usage_percent;
     double filtered_gap = target_mem_percent - filtered_mem_usage;
     
-    // 综合考虑当前和过滤后的差距，大差距时更关注当前值
-    double effective_gap;
-    if (fabs(mem_gap) > 5.0) {
-        // 显著差距时，主要考虑当前值
-        effective_gap = mem_gap * 0.8 + filtered_gap * 0.2;
-    } else {
-        // 小差距时，给滤波值更多权重
-        effective_gap = mem_gap * 0.4 + filtered_gap * 0.6;
+    // 使用自适应权重综合考虑当前和过滤后的差距
+    double current_weight = 0.5; // 默认权重
+    
+    // 调整权重 - 如果内存变化率高，偏向滤波值；如果变化率低，偏向当前值
+    if (avg_memory_change_rate > 1.5) {
+        // 高变化率，更多依赖滤波值
+        current_weight = 0.3;
+    } else if (avg_memory_change_rate < 0.5) {
+        // 低变化率，更多依赖当前值
+        current_weight = 0.7;
     }
     
-    // 在effective_gap计算中添加小偏移
+    double effective_gap = mem_gap * current_weight + filtered_gap * (1.0 - current_weight);
+    
+    // 添加稳定机制 - 如果接近目标，增加稳定计数，减少调整频率
+    if (fabs(effective_gap) < 2.0) {
+        stabilization_counter++;
+        // 在稳定区间，隔几次才进行调整
+        if (stabilization_counter < 3) {
+            // 跳过本次调整，保持当前状态
+            return;
+        }
+        stabilization_counter = 0;
+    } else {
+        // 不在稳定区间，重置计数器
+        stabilization_counter = 0;
+    }
+    
+    // 小差距时添加微小偏移以确保达到目标
     if (fabs(effective_gap) < 3.0 && effective_gap > 0) {
-        effective_gap += 0.5; // 添加额外偏移以确保达到目标
+        effective_gap += 0.3;
     }
     
     // 自动调整内存分配策略
-    if (effective_gap > 2.0) {
-        // 明显低于目标，增加调整系数
-        target_not_reached_counter += 2; // 增加计数器增长速度，更积极分配
+    if (effective_gap > 1.5) {
+        // 低于目标，增加调整系数
+        target_not_reached_counter++;
         
         // 如果连续多次未达到目标，增加调整系数
         if (target_not_reached_counter > 2) {
-            memory_adjustment_counter += 2; // 更快增加调整系数
-            if (memory_adjustment_counter > 10) memory_adjustment_counter = 10; // 提高最大调整系数
-            target_not_reached_counter = 0;
-            consecutive_failed_allocations = 0; // 重置失败计数
+            // 根据差距大小动态调整增量
+            int adjustment_increment = (int)(fabs(effective_gap) * 0.3);
+            if (adjustment_increment < 1) adjustment_increment = 1;
+            if (adjustment_increment > 3) adjustment_increment = 3;
             
-            // 仅在详细模式下输出调试信息
+            memory_adjustment_counter += adjustment_increment;
+            if (memory_adjustment_counter > 10) memory_adjustment_counter = 10;
+            target_not_reached_counter = 0;
+            consecutive_failed_allocations = 0;
+            
             if (verbose_mode) {
                 printf("内存调整：增加调整系数到 %d (差距: %.1f%%)\n", 
                        memory_adjustment_counter, effective_gap);
             }
         }
-    } else if (effective_gap < -3.0) {
-        // 明显高于目标，快速减少调整系数
+    } else if (effective_gap < -2.0) {
+        // 高于目标，快速减少调整系数
         target_not_reached_counter = 0;
         memory_adjustment_counter = 0;
         
-        // 立即释放部分内存
         if (verbose_mode) {
             printf("内存超出目标，立即释放部分内存 (差距: %.1f%%)\n", effective_gap);
         }
-    } else if (fabs(effective_gap) < 1.5) {
-        // 接近目标，缓慢减少调整系数
+    } else if (fabs(effective_gap) < 1.0) {
+        // 非常接近目标，缓慢减少调整系数，降低波动
         target_not_reached_counter = 0;
-        if (memory_adjustment_counter > 0 && (rand() % 3 == 0)) {
+        if (memory_adjustment_counter > 0 && (rand() % 5 == 0)) { // 降低减少概率
             memory_adjustment_counter--;
             if (verbose_mode) {
                 printf("内存接近目标，减少调整系数到 %d\n", memory_adjustment_counter);
@@ -528,7 +661,7 @@ void allocate_memory() {
         }
     }
     
-    // 如果连续分配失败，主动减少调整系数
+    // 处理连续分配失败
     if (consecutive_failed_allocations > 3) {
         if (memory_adjustment_counter > 0) {
             memory_adjustment_counter--;
@@ -542,31 +675,42 @@ void allocate_memory() {
     // 使用调整后的系数计算需要的内存
     double needed_mem_percent = effective_gap;
     
-    // 根据调整系数放大内存分配量，使用非线性增长
+    // 应用自适应调整因子
     double adjustment_factor = 1.0;
     if (memory_adjustment_counter > 0) {
-        adjustment_factor = 1.0 + (memory_adjustment_counter * 0.9); // 增加系数影响力
+        // 基础调整因子
+        adjustment_factor = 1.0 + (memory_adjustment_counter * 0.7);
         
-        // 差距越大，系数越大
+        // 根据差距大小动态调整因子
         if (fabs(effective_gap) > 8.0) {
-            adjustment_factor *= 2.0; // 大差距时使用更大系数
+            adjustment_factor *= 1.8;
         } else if (fabs(effective_gap) > 4.0) {
-            adjustment_factor *= 1.8; // 中等差距增加系数
+            adjustment_factor *= 1.5;
         } else if (fabs(effective_gap) > 1.0) {
-            adjustment_factor *= 1.3; // 即使小差距也增加系数
+            adjustment_factor *= 1.2;
         }
         
-        // 如果接近目标但仍未达到，额外增加系数
+        // 如果接近目标但仍未达到，适度增加因子
         if (effective_gap > 0 && effective_gap < 3.0) {
-            adjustment_factor += 0.5; // 接近目标时额外推一把
+            adjustment_factor += 0.3;
         }
     }
+    
+    // 应用内存变化率限制 - 变化大时减小调整因子
+    if (avg_memory_change_rate > 2.0) {
+        adjustment_factor *= 0.7; // 减小调整幅度以稳定系统
+    }
+    
     needed_mem_percent *= adjustment_factor;
     
-    // 添加滞后效应（hysteresis）减少抖动
-    const double hysteresis = 0.2; // 减小滞后效应以提高响应性
+    // 添加改进的滞后效应，减少抖动
+    double hysteresis = 0.15;
+    // 接近目标时使用更小的滞后值，允许更精确调整
+    if (fabs(effective_gap) < 2.0) {
+        hysteresis = 0.05;
+    }
     
-    // 如果所需的内存变化太小，保持当前分配
+    // 滞后效应处理
     if (fabs(needed_mem_percent - prev_needed_mem_percent) < hysteresis) {
         needed_mem_percent = prev_needed_mem_percent;
     } else {
@@ -575,10 +719,15 @@ void allocate_memory() {
     
     // 如果需要释放内存，清理之前的内存分配
     if (needed_mem_percent < -0.5) {
-        // 计算释放比例
-        int release_percent = (int)(fabs(needed_mem_percent) * 6.0);
-        if (release_percent < 5) release_percent = 5;
+        // 计算自适应释放比例，与差距成正比
+        int release_percent = (int)(fabs(needed_mem_percent) * 5.0);
+        if (release_percent < 3) release_percent = 3;
         if (release_percent > 50) release_percent = 50;
+        
+        // 如果内存过载严重，增加释放量
+        if (needed_mem_percent < -5.0) {
+            release_percent += 10;
+        }
         
         int blocks_to_free = (allocated_blocks * release_percent) / 100;
         if (blocks_to_free < 1 && allocated_blocks > 0) blocks_to_free = 1;
@@ -586,8 +735,10 @@ void allocate_memory() {
         
         // 释放部分内存块
         if (blocks_to_free > 0 && memory_blocks) {
-            printf("释放 %d 个内存块 (约 %d MB)，比例: %d%%\n", 
-                   blocks_to_free, blocks_to_free * block_size_mb, release_percent);
+            if (verbose_mode) {
+                printf("释放 %d 个内存块 (约 %d MB)，比例: %d%%\n", 
+                      blocks_to_free, blocks_to_free * block_size_mb, release_percent);
+            }
             
             for (int i = allocated_blocks - 1; i >= allocated_blocks - blocks_to_free; i--) {
                 if (memory_blocks[i]) {
@@ -622,41 +773,59 @@ void allocate_memory() {
         needed_mem_mb = (unsigned long long)(needed_mem_percent * total_system_memory_mb / 100.0);
     }
     
-    // 分配内存信息输出
+    // 详细模式下输出内存分配信息
     if (verbose_mode) {
-        printf("需要分配内存: %llu MB (当前: %.1f%% 实际/%.1f%% 滤波, 目标: %.1f%%, 差距: %.1f%%, 系数: %.1f)\n", 
+        printf("需要分配内存: %llu MB (当前: %.1f%% 实际/%.1f%% 滤波, 目标: %.1f%%, 差距: %.1f%%, 系数: %.1f, 变化率: %.2f%%)\n", 
                needed_mem_mb, current_mem_usage_percent, filtered_mem_usage, 
-               target_mem_percent, effective_gap, adjustment_factor);
+               target_mem_percent, effective_gap, adjustment_factor, avg_memory_change_rate);
     }
     
     if (needed_mem_mb == 0) {
         return;
     }
     
-    // 动态调整块大小
+    // 根据剩余分配量动态调整块大小，以实现更平滑的分配
     if (needed_mem_mb > 4000)
-        block_size_mb = 64; // 更大块大小
+        block_size_mb = 64;
     else if (needed_mem_mb > 1000)
-        block_size_mb = 32; // 更大块大小
+        block_size_mb = 32;
     else if (needed_mem_mb > 200)
-        block_size_mb = 16; // 更大块大小
+        block_size_mb = 16;
+    else if (needed_mem_mb > 50)
+        block_size_mb = 8;
+    else if (needed_mem_mb > 10)
+        block_size_mb = 4;
     else
-        block_size_mb = 8; // 默认使用较大块
+        block_size_mb = 2; // 较小块以实现更精细的控制
     
     int new_blocks = needed_mem_mb / block_size_mb;
     if (new_blocks == 0 && needed_mem_mb > 0) new_blocks = 1;
     
-    // 在Windows系统上，每次分配少量内存块
-    // 这可以更平滑地调整内存使用率，避免大幅度波动
+    // 限制每次分配的最大块数，实现更平滑的分配
 #ifdef _WIN32
-    // 只分配所需块数的一部分，分摊到多次循环
-    const int max_blocks_per_cycle = 500; // 大幅增加每次分配量
-    if (new_blocks > allocated_blocks + max_blocks_per_cycle) {
-        new_blocks = allocated_blocks + max_blocks_per_cycle;
+    // Windows系统上限制更严格
+    const int max_blocks_per_cycle = 300;
+#else
+    // Linux系统上的限制
+    const int max_blocks_per_cycle = 500;
+    
+    // 根据内存变化率自适应调整每次最大分配量
+    int adjusted_max_blocks = max_blocks_per_cycle;
+    if (avg_memory_change_rate > 2.0) {
+        // 变化率大，减少每次分配量
+        adjusted_max_blocks = max_blocks_per_cycle / 2;
+    } else if (avg_memory_change_rate < 0.5) {
+        // 变化率小，可以增加每次分配量
+        adjusted_max_blocks = max_blocks_per_cycle * 3 / 2;
+    }
+    
+    // 应用自适应限制
+    if (new_blocks > allocated_blocks + adjusted_max_blocks) {
+        new_blocks = allocated_blocks + adjusted_max_blocks;
     }
 #endif
     
-    // 处理原有分配
+    // 处理现有分配
     if (allocated_blocks > 0) {
         // 计算需要增加或减少的块数
         int diff_blocks = new_blocks - allocated_blocks;
@@ -665,7 +834,9 @@ void allocate_memory() {
             // 需要增加内存块
             char** new_memory_blocks = (char**)realloc(memory_blocks, new_blocks * sizeof(char*));
             if (!new_memory_blocks) {
-                printf("无法重新分配内存块数组\n");
+                if (verbose_mode) {
+                    printf("无法重新分配内存块数组\n");
+                }
                 consecutive_failed_allocations++;
                 return;
             }
@@ -678,21 +849,19 @@ void allocate_memory() {
             
             // 分配新增的块
             int success_count = 0;
-            for (int i = allocated_blocks; i < new_blocks; i++) {
-                memory_blocks[i] = (char*)malloc(block_size_mb * 1024 * 1024);
+            for (int i = allocated_blocks; i < new_blocks; i++) {                memory_blocks[i] = (char*)malloc(block_size_mb * 1024 * 1024);
                 if (memory_blocks[i]) {
-                    // 写入数据以确保物理内存被分配
-                    for (int j = 0; j < block_size_mb; j++) {
+                    // 采用高效的内存初始化方法：只写入部分数据以确保物理内存被分配
+                    for (int j = 0; j < block_size_mb; j += 2) {
                         size_t offset = j * 1024 * 1024;
-                        // 只写入部分数据，减轻系统负担
-                        if (j % 2 == 0) {
-                            memset(memory_blocks[i] + offset, i & 0xFF, 1024 * 1024 / 2);
-                        }
+                        memset(memory_blocks[i] + offset, 0xAA, 1024 * 256); // 只写入256KB
                     }
                     allocated_mb += block_size_mb;
                     success_count++;
                 } else {
-                    printf("无法分配内存块 #%d\n", i);
+                    if (verbose_mode) {
+                        printf("无法分配内存块 #%d\n", i);
+                    }
                     consecutive_failed_allocations++;
                     break; // 停止继续分配
                 }
@@ -706,7 +875,9 @@ void allocate_memory() {
             
             // 如果部分块分配失败，调整内存块数组大小
             if (success_count < diff_blocks) {
-                printf("警告：请求分配 %d 个块，但只成功分配了 %d 个\n", diff_blocks, success_count);
+                if (verbose_mode) {
+                    printf("警告：请求分配 %d 个块，但只成功分配了 %d 个\n", diff_blocks, success_count);
+                }
                 if (allocated_blocks < new_blocks) {
                     char** resize_blocks = (char**)realloc(memory_blocks, allocated_blocks * sizeof(char*));
                     if (resize_blocks) {
@@ -719,8 +890,15 @@ void allocate_memory() {
             // 需要减少内存块
             int blocks_to_free = -diff_blocks;
             
-            // 每次最多释放总数的50%，允许更大比例释放
-            int max_free = allocated_blocks * 0.5;
+            // 限制每次释放的比例，防止过度波动
+            int max_free_percent = 30; // 默认限制在30%
+            
+            // 如果内存需求大幅减少，允许更大比例释放
+            if (diff_blocks < -allocated_blocks / 2) {
+                max_free_percent = 50;
+            }
+            
+            int max_free = (allocated_blocks * max_free_percent) / 100;
             if (max_free < 1) max_free = 1;
             if (blocks_to_free > max_free) blocks_to_free = max_free;
             
@@ -740,7 +918,9 @@ void allocate_memory() {
             if (allocated_blocks > 0) {
                 char** new_memory_blocks = (char**)realloc(memory_blocks, allocated_blocks * sizeof(char*));
                 if (!new_memory_blocks) {
-                    printf("无法缩小内存块数组\n");
+                    if (verbose_mode) {
+                        printf("无法缩小内存块数组\n");
+                    }
                 } else {
                     memory_blocks = new_memory_blocks;
                 }
@@ -755,27 +935,27 @@ void allocate_memory() {
         memory_blocks = (char**)malloc(new_blocks * sizeof(char*));
         
         if (!memory_blocks) {
-            printf("无法分配内存块数组\n");
+            if (verbose_mode) {
+                printf("无法分配内存块数组\n");
+            }
             consecutive_failed_allocations++;
             return;
         }
         
         int success_count = 0;
-        for (int i = 0; i < new_blocks; i++) {
-            memory_blocks[i] = (char*)malloc(block_size_mb * 1024 * 1024);
+        for (int i = 0; i < new_blocks; i++) {            memory_blocks[i] = (char*)malloc(block_size_mb * 1024 * 1024);
             if (memory_blocks[i]) {
-                // 写入数据以确保物理内存被分配
-                for (int j = 0; j < block_size_mb; j++) {
+                // 采用高效的内存初始化方法：只写入部分数据以确保物理内存被分配
+                for (int j = 0; j < block_size_mb; j += 2) {
                     size_t offset = j * 1024 * 1024;
-                    // 只写入部分数据，减轻系统负担
-                    if (j % 2 == 0) {
-                        memset(memory_blocks[i] + offset, i & 0xFF, 1024 * 1024 / 2);
-                    }
+                    memset(memory_blocks[i] + offset, 0xAA, 1024 * 256); // 只写入256KB
                 }
                 allocated_mb += block_size_mb;
                 success_count++;
             } else {
-                printf("无法分配内存块 #%d\n", i);
+                if (verbose_mode) {
+                    printf("无法分配内存块 #%d\n", i);
+                }
                 consecutive_failed_allocations++;
                 break; // 停止继续尝试
             }
@@ -789,7 +969,9 @@ void allocate_memory() {
         
         // 如果部分块分配失败，调整内存块数组大小
         if (success_count < new_blocks) {
-            printf("警告：请求分配 %d 个块，但只成功分配了 %d 个\n", new_blocks, success_count);
+            if (verbose_mode) {
+                printf("警告：请求分配 %d 个块，但只成功分配了 %d 个\n", new_blocks, success_count);
+            }
             if (success_count > 0) {
                 char** resize_blocks = (char**)realloc(memory_blocks, success_count * sizeof(char*));
                 if (resize_blocks) {
