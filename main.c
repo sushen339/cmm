@@ -1,6 +1,6 @@
 /*
  * CMM - CPU和内存模拟器
- * 版本: 1.0.0
+ * 版本: 1.0.1
  * 
  * 用于在系统上模拟特定的CPU和内存负载
  * 支持Windows和Linux平台
@@ -1032,34 +1032,79 @@ double get_self_cpu_usage() {
     }
     
     return cpu_usage;
-#else
-    // Linux实现
-    static clock_t last_cpu_time = 0;
-    static clock_t last_sys_time = 0;
+#else    // Linux实现 - 使用/proc/self/stat获取更准确的数据
+    static unsigned long long last_utime = 0, last_stime = 0;
+    static unsigned long long last_total_time = 0;
     
-    struct tms process_times;
-    clock_t current_sys_time = times(&process_times);
-    clock_t current_cpu_time = process_times.tms_utime + process_times.tms_stime;
+    // 获取系统总时间
+    FILE* fp = fopen("/proc/stat", "r");
+    if (fp == NULL) return 0.0;
     
-    if (last_cpu_time == 0) {
-        last_cpu_time = current_cpu_time;
-        last_sys_time = current_sys_time;
+    char buffer[1024];
+    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
+        fclose(fp);
+        return 0.0;
+    }
+    fclose(fp);
+    
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    sscanf(buffer, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", 
+           &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+    
+    unsigned long long total_time = user + nice + system + idle + iowait + irq + softirq + steal;
+    
+    // 获取进程CPU时间
+    fp = fopen("/proc/self/stat", "r");
+    if (fp == NULL) return 0.0;
+    
+    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
+        fclose(fp);
+        return 0.0;
+    }
+    fclose(fp);
+    
+    // 解析/proc/self/stat获取utime和stime (字段14和15)
+    char* p = buffer;
+    for (int i = 0; i < 13; i++) {
+        p = strchr(p + 1, ' ');
+        if (!p) return 0.0;
+    }
+    
+    unsigned long long utime, stime;
+    if (sscanf(p, " %llu %llu", &utime, &stime) != 2) {
         return 0.0;
     }
     
-    // 修复CPU使用率计算，不除以核心数，使计算方式与总CPU使用率一致
-    double cpu_usage = (double)(current_cpu_time - last_cpu_time) * 100.0 / 
-                       (current_sys_time - last_sys_time);
-                       
-    last_cpu_time = current_cpu_time;
-    last_sys_time = current_sys_time;
+    unsigned long long process_time = utime + stime;
+    
+    // 首次调用，初始化基准值
+    if (last_utime == 0 || last_total_time == 0) {
+        last_utime = utime;
+        last_stime = stime;
+        last_total_time = total_time;
+        return 0.0;
+    }
+    
+    // 计算使用率: 进程时间变化 / 系统总时间变化 * 100
+    unsigned long long process_time_diff = process_time - (last_utime + last_stime);
+    unsigned long long total_time_diff = total_time - last_total_time;
+    
+    // 更新历史值
+    last_utime = utime;
+    last_stime = stime;
+    last_total_time = total_time;
+    
+    if (total_time_diff == 0) return 0.0;
+    
+    double cpu_usage = (double)process_time_diff * 100.0 / total_time_diff;
     
     // 限制在合理范围内
     if (isnan(cpu_usage) || cpu_usage < 0) {
         return 0.0;
     }
-    if (cpu_usage > 100.0) {
-        return 100.0;
+    // 多核系统下，进程CPU使用率可能超过100%
+    if (cpu_usage > 100.0 * num_cpu_cores) {
+        return 100.0 * num_cpu_cores;
     }
     
     return cpu_usage;
@@ -1265,8 +1310,7 @@ int main(int argc, char *argv[]) {
 #else
     usleep(1000 * 1000);
 #endif
-    
-    // 创建CPU负载调整线程
+      // 创建CPU负载调整线程
 #ifdef _WIN32
     HANDLE adjust_thread = CreateThread(NULL, 0, 
                                  (LPTHREAD_START_ROUTINE)adjust_cpu_load_thread, 
@@ -1323,8 +1367,7 @@ int main(int argc, char *argv[]) {
         }
     }
 #endif
-    
-    // 主循环，处理内存分配并显示状态
+      // 主循环，处理内存分配并显示状态
     while (running) {
         allocate_memory();
         
@@ -1336,8 +1379,6 @@ int main(int argc, char *argv[]) {
             // 生成CPU和内存进度条
             char cpu_bar[128] = {0};
             char mem_bar[128] = {0};
-            generate_progress_bar(cpu_bar, sizeof(cpu_bar), current_cpu_load, 30);
-            generate_progress_bar(mem_bar, sizeof(mem_bar), get_system_mem_usage(), 30);
             
             // 基本状态信息
             printf("\n系统状态:\n");
@@ -1349,15 +1390,22 @@ int main(int argc, char *argv[]) {
             strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", timeinfo);
             printf("当前时间: %s\n\n", timestr);
             
+            // 获取并处理CPU使用率，当接近目标值时显示目标值
+            double display_cpu_usage = current_cpu_load;
+            if (display_cpu_usage > target_cpu_usage * 0.95 && display_cpu_usage < target_cpu_usage * 1.05) {
+                display_cpu_usage = target_cpu_usage;
+            }
+            
             // 获取并处理内存使用率，当接近目标值时显示目标值
             double display_mem_usage = get_system_mem_usage();
-            int target_mem_percent = (int)(target_mem_usage_mb * 100.0 / get_total_system_memory() + 0.5); // 加0.5进行四舍五入
-            // 如果内存使用率达到目标值的95%以上且小于目标值的105%，则显示为目标值
+            int target_mem_percent = (int)(target_mem_usage_mb * 100.0 / get_total_system_memory() + 0.5);
             if (display_mem_usage > target_mem_percent * 0.95 && display_mem_usage < target_mem_percent * 1.05) {
                 display_mem_usage = target_mem_percent;
-                // 重新生成内存进度条
-                generate_progress_bar(mem_bar, sizeof(mem_bar), display_mem_usage, 30);
             }
+            
+            // 生成进度条
+            generate_progress_bar(cpu_bar, sizeof(cpu_bar), display_cpu_usage, 30);
+            generate_progress_bar(mem_bar, sizeof(mem_bar), display_mem_usage, 30);
             
             // 获取自身资源占用情况
             double self_cpu = get_self_cpu_usage();
@@ -1365,18 +1413,15 @@ int main(int argc, char *argv[]) {
             unsigned long long total_mem_mb = get_total_system_memory();
             double self_mem_percent = (double)self_mem_mb * 100.0 / total_mem_mb;
             
-            // 修复问题：确保系统占用率不包含CMM自身的占用
-            // 生成进度条时仍使用current_cpu_load（总体占用）
-            double system_cpu = current_cpu_load - self_cpu;
+            // 计算系统占用率（不包含CMM自身）
+            double system_cpu = display_cpu_usage - self_cpu;
             double system_mem = display_mem_usage - self_mem_percent;
             
             // 确保显示值不为负
             if (system_cpu < 0) system_cpu = 0;
             if (system_mem < 0) system_mem = 0;
             
-            // 重新生成CPU进度条，确保它显示总体占用率
-            generate_progress_bar(cpu_bar, sizeof(cpu_bar), current_cpu_load, 30);
-            
+            // 显示CPU和内存使用情况
             printf("CPU: %s (目标：%d%%, 系统：%.1f%%, CMM：%.1f%%)\n", 
                    cpu_bar, target_cpu_usage, system_cpu, self_cpu);
             printf("MEM: %s (目标：%d%%, 系统：%.1f%%, CMM：%.1f%%)\n",
@@ -1384,8 +1429,9 @@ int main(int argc, char *argv[]) {
             
             // 详细模式下显示更多信息
             if (verbose_mode) {
-                printf("详细信息: CPU控制: %d%%, MEM使用率: %.1f%% (滤波 %.1f%%)\n",
-                       busy_percentage, get_system_mem_usage(), filtered_mem_usage);
+                printf("详细信息: CPU占用=%6.2f%%, 控制=%3d%%, 滤波值=%.1f%%, MEM占用=%.1f%%, 滤波值=%.1f%%\n",
+                       current_cpu_load, busy_percentage, filtered_cpu_usage, 
+                       get_system_mem_usage(), filtered_mem_usage);
                 printf("控制参数: PID(%.2f, %.2f, %.2f), 滤波系数: %.2f, CPU核心: %d\n",
                        pid_kp, pid_ki, pid_kd, filter_alpha, num_cpu_cores);
             }
