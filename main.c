@@ -1,6 +1,6 @@
 /*
  * CMM - CPU和内存模拟器
- * 版本: 1.1.1
+ * 版本: 1.1.2
  * 
  * 用于在系统上模拟特定的CPU和内存负载
  * 支持Windows和Linux平台
@@ -22,6 +22,7 @@
 #include <psapi.h>
 #include <process.h>
 #include <pdh.h>
+#include <tlhelp32.h> // 用于Process32First/Next函数
 #else
 #include <pthread.h>
 #include <sys/resource.h>
@@ -31,6 +32,7 @@
 #include <sys/times.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h> // 用于strerror函数
 #endif
 
 // 全局变量
@@ -1082,10 +1084,12 @@ void print_usage() {
     printf("  -l <file>         加载配置文件\n");
     printf("  -s [file]         保存配置到文件 (默认: cmm.conf)\n");
     printf("  -d                以守护进程/后台模式运行\n");
+    printf("  -k                查找并终止所有正在运行的CMM进程\n");
     printf("  -h                显示此帮助信息\n");
     printf("例子: ./cmm -c 50 -m 50 -v\n");
     printf("      ./cmm -l my_config.conf\n");
     printf("      ./cmm -c 50 -m 50 -d\n");
+    printf("      ./cmm -k      # 终止所有正在运行的CMM进程\n");
 }
 
 // 加载配置文件
@@ -1330,6 +1334,106 @@ unsigned long long get_self_memory_usage_mb() {
 #endif
 }
 
+// 终止所有CMM进程
+bool kill_all_cmm_processes() {
+#ifdef _WIN32
+    // Windows实现
+    printf("正在查找并终止所有CMM进程...\n");
+    
+    // 创建进程快照
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        printf("无法创建进程快照: %lu\n", GetLastError());
+        return false;
+    }
+    
+    // 获取当前进程ID，避免终止自己
+    DWORD current_pid = GetCurrentProcessId();
+    int killed_count = 0;
+    
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            // 检查进程名称是否为cmm.exe或类似名称
+            if (stricmp(pe32.szExeFile, "cmm.exe") == 0 || 
+                stricmp(pe32.szExeFile, "cmm") == 0) {
+                
+                // 跳过当前进程
+                if (pe32.th32ProcessID == current_pid) {
+                    continue;
+                }
+                
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProcess != NULL) {
+                    if (TerminateProcess(hProcess, 0)) {
+                        printf("已终止进程: %s (PID: %lu)\n", pe32.szExeFile, pe32.th32ProcessID);
+                        killed_count++;
+                    } else {
+                        printf("无法终止进程 %s (PID: %lu): %lu\n", 
+                               pe32.szExeFile, pe32.th32ProcessID, GetLastError());
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+            
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    
+    CloseHandle(hSnapshot);
+    
+    if (killed_count == 0) {
+        printf("未找到其他CMM进程\n");
+    } else {
+        printf("成功终止 %d 个CMM进程\n", killed_count);
+    }
+    
+    return true;
+#else
+    // Linux实现
+    printf("正在查找并终止所有CMM进程...\n");
+    
+    // 使用pgrep命令查找所有cmm进程
+    FILE* fp = popen("pgrep -x cmm", "r");
+    if (fp == NULL) {
+        printf("无法执行查找进程命令\n");
+        return false;
+    }
+    
+    char buffer[32];
+    int killed_count = 0;
+    pid_t current_pid = getpid();
+    
+    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        pid_t pid = atoi(buffer);
+        
+        // 跳过当前进程
+        if (pid == current_pid) {
+            continue;
+        }
+        
+        // 终止进程
+        if (kill(pid, SIGTERM) == 0) {
+            printf("已终止进程 (PID: %d)\n", pid);
+            killed_count++;
+        } else {
+            printf("无法终止进程 (PID: %d): %s\n", pid, strerror(errno));
+        }
+    }
+    
+    pclose(fp);
+    
+    if (killed_count == 0) {
+        printf("未找到其他CMM进程\n");
+    } else {
+        printf("成功终止 %d 个CMM进程\n", killed_count);
+    }
+    
+    return true;
+#endif
+}
+
 int main(int argc, char *argv[]) {
     // 设置本地化，解决中文乱码
 #ifdef _WIN32
@@ -1357,14 +1461,16 @@ int main(int argc, char *argv[]) {
     bool mem_set = false;
     bool load_config_specified = false;
     
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0) {
+    for (int i = 1; i < argc; i++) {        if (strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose_mode = true;
         } else if (strcmp(argv[i], "-d") == 0) {
             daemon_mode = true;
+        } else if (strcmp(argv[i], "-k") == 0) {
+            // 终止所有CMM进程
+            return kill_all_cmm_processes() ? 0 : 1;
         } else if (strcmp(argv[i], "-s") == 0) {
             save_config = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -1427,12 +1533,12 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
         // Windows后台运行
         printf("将在后台运行，关闭此窗口程序仍将继续运行\n");
-        printf("使用任务管理器结束进程可停止程序\n");
+        printf("使用'-k'参数或任务管理器结束进程可停止程序\n");
         FreeConsole(); // 分离当前控制台
 #else
         // Linux守护进程模式
         printf("将以守护进程模式运行\n");
-        printf("使用 'ps -ef | grep cmm' 查找进程ID，使用 'kill [PID]' 停止程序\n");
+        printf("使用'-k'参数或使用 'ps -ef | grep cmm' 查找进程ID，使用 'kill [PID]' 停止程序\n");
         
         // 创建子进程
         pid_t pid = fork();
@@ -1660,4 +1766,4 @@ int main(int argc, char *argv[]) {
     
     printf("\n程序已退出\n");    
     return 0;
-} 
+}
